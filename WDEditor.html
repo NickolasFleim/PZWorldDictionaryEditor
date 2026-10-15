@@ -1,0 +1,527 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WorldDictionary Editor</title>
+<style>
+body { font: 14px sans-serif; background: #fff; color: #000; margin: 8px 16px; }
+[hidden] { display: none !important; }
+.ok { color: green; }
+.warn { color: #b36b00; }
+.err { color: red; }
+</style>
+</head>
+<body>
+
+<h1>WorldDictionary Editor</h1>
+<p>
+  <input id="file-input" type="file" accept=".bin,application/octet-stream">
+  <button id="btn-save">Save</button>
+  <button id="btn-undo">Undo</button>
+  <button id="btn-reset">Reset all</button>
+</p>
+<p id="status"></p>
+<p id="facts"></p>
+
+<div id="tabs"></div>
+<p>
+  Search: <input id="q" type="search" size="40">
+  <select id="f-mod"></select>
+  <select id="f-state"></select>
+</p>
+<div style="overflow-x: auto"><table id="table" border="1" cellpadding="3" cellspacing="0"></table></div>
+<p id="pager"></p>
+
+<h2>Changes</h2>
+<ol id="changes"></ol>
+
+<h2>Problems</h2>
+<ul id="issues"></ul>
+
+<script>
+const WD = (() => {
+  const F_MODDED = 1, F_VANILLA = 2, F_OBSOLETE = 4, F_REMOVED = 8, F_OVERRIDES = 16, F_MANY = 32;
+  const dec = new TextDecoder("utf-8");
+  const enc = new TextEncoder();
+
+  class R {
+    constructor(u8) { this.u8 = u8; this.v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength); this.p = 0; }
+    i8() { const x = this.v.getInt8(this.p); this.p += 1; return x; }
+    u8b() { const x = this.v.getUint8(this.p); this.p += 1; return x; }
+    i16() { const x = this.v.getInt16(this.p); this.p += 2; return x; }
+    i32() { const x = this.v.getInt32(this.p); this.p += 4; return x; }
+    i64() { const x = this.v.getBigInt64(this.p); this.p += 8; return x; }
+    str() {
+      const n = this.i16();
+      if (n <= 0) return "";
+      const s = dec.decode(this.u8.subarray(this.p, this.p + n));
+      this.p += n;
+      return s;
+    }
+    need(n) { if (this.p + n > this.u8.length) throw new Error("File ends unexpectedly at byte " + this.p); }
+  }
+
+  class W {
+    constructor() { this.buf = new Uint8Array(1 << 16); this.v = new DataView(this.buf.buffer); this.p = 0; }
+    grow(n) {
+      if (this.p + n <= this.buf.length) return;
+      let size = this.buf.length * 2;
+      while (size < this.p + n) size *= 2;
+      const nb = new Uint8Array(size); nb.set(this.buf); this.buf = nb; this.v = new DataView(nb.buffer);
+    }
+    i8(x) { this.grow(1); this.v.setInt8(this.p, x); this.p += 1; }
+    u8b(x) { this.grow(1); this.v.setUint8(this.p, x); this.p += 1; }
+    i16(x) { this.grow(2); this.v.setInt16(this.p, x); this.p += 2; }
+    i32(x) { this.grow(4); this.v.setInt32(this.p, x); this.p += 4; }
+    i64(x) { this.grow(8); this.v.setBigInt64(this.p, BigInt(x)); this.p += 8; }
+    bytes(b) { this.grow(b.length); this.buf.set(b, this.p); this.p += b.length; }
+    str(s) {
+      const b = enc.encode(s);
+      if (b.length > 32767) throw new Error("String too long: " + s.slice(0, 40));
+      this.i16(b.length); this.bytes(b);
+    }
+    out() { return this.buf.slice(0, this.p); }
+  }
+
+  const idxRead = (r, list) => (list.length > 127 ? r.i16() : r.i8());
+  function idxWrite(w, list, value) {
+    const i = list.indexOf(value);
+    if (i < 0) throw new Error("Not in list: " + value);
+    if (list.length > 127) w.i16(i); else w.i8(i);
+  }
+  function pick(list, i, what) {
+    if (i < 0 || i >= list.length) throw new Error("Invalid " + what + " index: " + i);
+    return list[i];
+  }
+
+  function readInfo(r, mods, modules) {
+    const id = r.i16();
+    const module = pick(modules, idxRead(r, modules), "module");
+    const name = r.str();
+    const flags = r.u8b();
+    const info = {
+      id, module, name,
+      modId: (flags & F_MODDED) ? pick(mods, idxRead(r, mods), "mod") : null,
+      existsAsVanilla: !!(flags & F_VANILLA),
+      obsolete: !!(flags & F_OBSOLETE),
+      removed: !!(flags & F_REMOVED),
+      overrides: null,
+      many: false,
+    };
+    if (flags & F_OVERRIDES) {
+      if (flags & F_MANY) {
+        const count = r.i8();
+        info.overrides = [];
+        for (let k = 0; k < count; k++) info.overrides.push(pick(mods, idxRead(r, mods), "mod"));
+        info.many = true;
+      } else {
+        info.overrides = [pick(mods, idxRead(r, mods), "mod")];
+      }
+    }
+    return info;
+  }
+
+  function writeInfo(w, info, mods, modules) {
+    w.i16(info.id);
+    idxWrite(w, modules, info.module);
+    w.str(info.name);
+    let flags = 0;
+    if (info.modId != null) flags |= F_MODDED;
+    if (info.existsAsVanilla) flags |= F_VANILLA;
+    if (info.obsolete) flags |= F_OBSOLETE;
+    if (info.removed) flags |= F_REMOVED;
+    const ov = info.overrides;
+    const many = ov ? (info.many || ov.length !== 1) : false;
+    if (ov) { flags |= F_OVERRIDES; if (many) flags |= F_MANY; }
+    w.u8b(flags);
+    if (info.modId != null) idxWrite(w, mods, info.modId);
+    if (ov) {
+      if (many) { w.i8(ov.length); ov.forEach((m) => idxWrite(w, mods, m)); }
+      else idxWrite(w, mods, ov[0]);
+    }
+  }
+
+  function readRegister(r, scripts) {
+    const len = r.i32();
+    const end = r.p + len;
+    r.need(len);
+    const reg = { nextId: r.i16(), entries: [] };
+    const n = r.i32();
+    for (let k = 0; k < n; k++) {
+      const flags = r.u8b();
+      const e = { id: r.i16() };
+      if (scripts) e.version = r.i64().toString();
+      const s = r.str();
+      e.name = (flags & 1) ? "Base." + s : s;
+      e.isLoaded = !!(flags & 2);
+      reg.entries.push(e);
+    }
+    if (r.p !== end) throw new Error("Register block size mismatch");
+    return reg;
+  }
+
+  function writeRegister(w, reg, scripts) {
+    const inner = new W();
+    inner.i16(reg.nextId);
+    inner.i32(reg.entries.length);
+    for (const e of reg.entries) {
+      let name = e.name, flags = 0;
+      if (name.startsWith("Base.") && name.length > 5) { flags |= 1; name = name.slice(5); }
+      if (e.isLoaded) flags |= 2;
+      inner.u8b(flags);
+      inner.i16(e.id);
+      if (scripts) inner.i64(e.version);
+      inner.str(name);
+    }
+    const b = inner.out();
+    w.i32(b.length);
+    w.bytes(b);
+  }
+
+  function parse(u8) {
+    const r = new R(u8);
+    const wd = { version: r.i32(), nextInfoId: r.i16(), nextObjectNameId: r.i8(), nextSpriteNameId: r.i32() };
+    const list = () => { const n = r.i32(); const a = []; for (let k = 0; k < n; k++) a.push(r.str()); return a; };
+    wd.mods = list();
+    wd.modules = list();
+    const infos = () => { const n = r.i32(); const a = []; for (let k = 0; k < n; k++) a.push(readInfo(r, wd.mods, wd.modules)); return a; };
+    wd.items = infos();
+    wd.entities = infos();
+    wd.objectNames = [];
+    for (let n = r.i32(), k = 0; k < n; k++) wd.objectNames.push({ id: r.i8(), name: r.str() });
+    wd.spriteNames = [];
+    for (let n = r.i32(), k = 0; k < n; k++) wd.spriteNames.push({ id: r.i32(), name: r.str() });
+    wd.stringRegisters = [];
+    for (let n = r.i32(), k = 0; k < n; k++) { const register = r.str(); wd.stringRegisters.push({ register, ...readRegister(r, false) }); }
+    wd.scriptRegisters = [];
+    for (let n = r.i32(), k = 0; k < n; k++) { const register = r.str(); wd.scriptRegisters.push({ register, ...readRegister(r, true) }); }
+    if (r.p !== u8.length) throw new Error("Extra bytes at end of file: " + (u8.length - r.p));
+    return wd;
+  }
+
+  function serialize(wd) {
+    const need = (list, v) => { if (v != null && !list.includes(v)) list.push(v); };
+    for (const info of wd.items.concat(wd.entities)) {
+      need(wd.modules, info.module);
+      need(wd.mods, info.modId);
+      (info.overrides || []).forEach((m) => need(wd.mods, m));
+    }
+    const w = new W();
+    w.i32(wd.version); w.i16(wd.nextInfoId); w.i8(wd.nextObjectNameId); w.i32(wd.nextSpriteNameId);
+    for (const key of ["mods", "modules"]) { w.i32(wd[key].length); wd[key].forEach((s) => w.str(s)); }
+    for (const key of ["items", "entities"]) { w.i32(wd[key].length); wd[key].forEach((i) => writeInfo(w, i, wd.mods, wd.modules)); }
+    w.i32(wd.objectNames.length); wd.objectNames.forEach((o) => { w.i8(o.id); w.str(o.name); });
+    w.i32(wd.spriteNames.length); wd.spriteNames.forEach((o) => { w.i32(o.id); w.str(o.name); });
+    w.i32(wd.stringRegisters.length); wd.stringRegisters.forEach((g) => { w.str(g.register); writeRegister(w, g, false); });
+    w.i32(wd.scriptRegisters.length); wd.scriptRegisters.forEach((g) => { w.str(g.register); writeRegister(w, g, true); });
+    return w.out();
+  }
+
+  function fullType(e) { return e.module + "." + e.name; }
+  function splitFull(full) { const i = full.indexOf("."); return i < 0 ? null : { module: full.slice(0, i), name: full.slice(i + 1) }; }
+
+  return { parse, serialize, fullType, splitFull };
+})();
+if (typeof module !== "undefined") module.exports = WD;
+
+</script>
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids) if (kid != null) e.append(kid);
+  return e;
+};
+
+const state = { fileName: null, original: null, wd: null, history: [], changes: [], changed: new Set(), tab: "entities", page: 0, editing: null, confirming: null };
+const PAGE = 100;
+
+function sections() {
+  const wd = state.wd;
+  const list = [
+    { key: "items", label: "Items", kind: "info", rows: wd.items },
+    { key: "entities", label: "Entities", kind: "info", rows: wd.entities },
+  ];
+  wd.scriptRegisters.forEach((g, i) => list.push({ key: "script:" + i, label: g.register, kind: "script", rows: g.entries }));
+  wd.stringRegisters.forEach((g, i) => list.push({ key: "string:" + i, label: "Strings: " + g.register, kind: "string", rows: g.entries }));
+  list.push({ key: "objects", label: "Object names", kind: "objname", rows: wd.objectNames });
+  list.push({ key: "lists", label: "Mods / modules", kind: "lists", rows: [] });
+  return list;
+}
+const current = () => sections().find((s) => s.key === state.tab) || sections()[0];
+const fullName = (s, r) => (s.kind === "info" ? WD.fullType(r) : r.name);
+const rowKey = (s, r) => s.key + ":" + r.id;
+
+function setStatus(text, cls = "") { const s = $("status"); s.textContent = text; s.className = cls; }
+
+function load(u8, name) {
+  try {
+    const wd = WD.parse(u8);
+    const check = WD.serialize(structuredClone(wd));
+    const same = check.length === u8.length && check.every((b, i) => b === u8[i]);
+    Object.assign(state, { fileName: name, original: u8, wd, history: [], changes: [], changed: new Set(), page: 0, editing: null, confirming: null });
+    $("btn-save").disabled = false;
+    setStatus(same ? `Loaded ${name}. Read OK, writes back identical.` : `Loaded ${name}, but writing it back gives a different file. Saving is risky.`, same ? "ok" : "warn");
+    renderAll();
+  } catch (err) {
+    setStatus(`Could not read ${name}: ${err.message}`, "err");
+  }
+}
+
+function snapshot(desc, keys = []) {
+  state.history.push({ wd: structuredClone(state.wd), changes: state.changes.slice(), changed: new Set(state.changed) });
+  if (state.history.length > 40) state.history.shift();
+  state.changes.push(desc);
+  keys.forEach((k) => state.changed.add(k));
+}
+
+function facts() {
+  const wd = state.wd;
+  $("facts").textContent = wd ? `File: ${state.fileName} | format version ${wd.version} | items ${wd.items.length} | entities ${wd.entities.length} | mods ${wd.mods.length} | changes ${state.changes.length}` : "";
+}
+
+function renderTabs() {
+  const t = $("tabs"); t.textContent = "";
+  for (const s of sections()) {
+    const count = s.kind === "lists" ? state.wd.mods.length + state.wd.modules.length : s.rows.length;
+    t.append(el("button", { disabled: s.key === state.tab, onclick: () => { state.tab = s.key; state.page = 0; state.editing = null; state.confirming = null; renderFilters(); renderTable(); renderTabs(); } }, `${s.label} (${count})`), " ");
+  }
+}
+
+function renderFilters() {
+  const s = current();
+  const mod = $("f-mod"), st = $("f-state");
+  const keepMod = mod.value, keepSt = st.value;
+  mod.textContent = ""; st.textContent = "";
+  mod.append(el("option", { value: "", text: "all mods" }));
+  if (s.kind === "info") {
+    const used = new Map();
+    s.rows.forEach((r) => { const m = r.modId || "pz-vanilla"; used.set(m, (used.get(m) || 0) + 1); });
+    [...used.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(([m, n]) => mod.append(el("option", { value: m, text: `${m} (${n})` })));
+  }
+  mod.hidden = s.kind !== "info";
+  const opts = [["", "any state"], ["changed", "changed"]];
+  if (s.kind === "info") opts.push(["removed", "removed"], ["alive", "not removed"], ["obsolete", "obsolete"]);
+  if (s.kind === "script" || s.kind === "string") opts.push(["loaded", "loaded"], ["unloaded", "not loaded"]);
+  opts.forEach(([v, t]) => st.append(el("option", { value: v, text: t })));
+  st.hidden = s.kind === "lists" || s.kind === "objname";
+  if ([...mod.options].some((o) => o.value === keepMod)) mod.value = keepMod;
+  if ([...st.options].some((o) => o.value === keepSt)) st.value = keepSt;
+}
+
+function filtered(s) {
+  const q = $("q").value.trim().toLowerCase();
+  const mod = $("f-mod").value, st = $("f-state").value;
+  return s.rows.filter((r) => {
+    if (q && !(fullName(s, r) + " " + (r.modId || "") + " #" + r.id).toLowerCase().includes(q)) return false;
+    if (mod && s.kind === "info" && (r.modId || "pz-vanilla") !== mod) return false;
+    if (st === "changed" && !state.changed.has(rowKey(s, r))) return false;
+    if (st === "removed" && !r.removed) return false;
+    if (st === "alive" && r.removed) return false;
+    if (st === "obsolete" && !r.obsolete) return false;
+    if (st === "loaded" && !r.isLoaded) return false;
+    if (st === "unloaded" && r.isLoaded) return false;
+    return true;
+  });
+}
+
+function flagBox(s, r, field, label) {
+  const cb = el("input", { type: "checkbox", id: `cb-${field}-${r.id}` });
+  cb.checked = !!r[field];
+  cb.addEventListener("change", () => {
+    snapshot(`${s.label} #${r.id} ${fullName(s, r)}: ${label} = ${cb.checked}`, [rowKey(s, r)]);
+    r[field] = cb.checked;
+    renderAll();
+  });
+  return el("label", {}, cb, " " + label + " ");
+}
+
+function deleteRow(s, r) {
+  snapshot(`${s.label} #${r.id} ${fullName(s, r)}: deleted`);
+  const i = s.rows.indexOf(r);
+  if (i >= 0) s.rows.splice(i, 1);
+  state.confirming = null;
+  renderAll();
+}
+
+function editor(s, r) {
+  const div = el("div");
+  const nameIn = el("input", { type: "text", size: "45", value: fullName(s, r) });
+  div.append(el("div", {}, "Full name: ", nameIn));
+  let modIn = null, ovIn = null, verIn = null;
+  if (s.kind === "info") {
+    modIn = el("input", { type: "text", size: "30", value: r.modId || "", placeholder: "empty = vanilla" });
+    ovIn = el("input", { type: "text", size: "30", value: (r.overrides || []).join(", "), placeholder: "comma separated" });
+    div.append(el("div", {}, "Mod: ", modIn), el("div", {}, "Overridden by: ", ovIn));
+  }
+  if (s.kind === "script") {
+    verIn = el("input", { type: "text", size: "25", value: r.version });
+    div.append(el("div", {}, "Version: ", verIn));
+  }
+  const err = el("div", { class: "err" });
+  const save = () => {
+    const full = nameIn.value.trim();
+    let split = null;
+    if (!full) { err.textContent = "Name is empty."; return; }
+    if (s.kind === "info") { split = WD.splitFull(full); if (!split || !split.module || !split.name) { err.textContent = "Use Module.Name."; return; } }
+    if (s.rows.some((o) => o !== r && fullName(s, o) === full)) { err.textContent = "This name already exists in this section."; return; }
+    if (verIn && !/^-?\d+$/.test(verIn.value.trim())) { err.textContent = "Version must be an integer."; return; }
+    snapshot(`${s.label} #${r.id} ${fullName(s, r)}: edited`, [rowKey(s, r)]);
+    if (s.kind === "info") {
+      r.module = split.module; r.name = split.name;
+      const m = modIn.value.trim(); r.modId = m && m !== "pz-vanilla" ? m : null;
+      const ov = ovIn.value.split(",").map((x) => x.trim()).filter(Boolean);
+      r.overrides = ov.length ? ov : null; r.many = ov.length > 1;
+    } else r.name = full;
+    if (verIn) r.version = verIn.value.trim();
+    state.editing = null;
+    renderAll();
+  };
+  div.append(err, el("button", { onclick: save, text: "OK" }), " ", el("button", { onclick: () => { state.editing = null; renderTable(); }, text: "Cancel" }));
+  return div;
+}
+
+function renderTable() {
+  const s = current();
+  const table = $("table"); table.textContent = "";
+  const pager = $("pager"); pager.textContent = "";
+  if (s.kind === "lists") return renderLists(table);
+  const rows = filtered(s);
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  if (state.page >= pages) state.page = pages - 1;
+  const cols = s.kind === "info" ? ["ID", "Name", "Mod", "Flags", ""] : s.kind === "script" ? ["ID", "Name", "Version", "Flags", ""] : s.kind === "string" ? ["ID", "String", "Flags", ""] : ["ID", "Name"];
+  table.append(el("tr", {}, ...cols.map((c) => el("th", { text: c }))));
+  if (!rows.length) table.append(el("tr", {}, el("td", { colspan: String(cols.length), text: "Nothing found." })));
+  for (const r of rows.slice(state.page * PAGE, state.page * PAGE + PAGE)) {
+    const key = rowKey(s, r);
+    const tr = el("tr");
+    tr.append(el("td", { text: String(r.id) + (state.changed.has(key) ? " *" : "") }));
+    const nameCell = el("td", {}, fullName(s, r));
+    if (state.editing === key) nameCell.append(editor(s, r));
+    if (state.confirming === key) {
+      nameCell.append(el("div", { class: "err" }, "Delete this entry? ",
+        el("button", { onclick: () => deleteRow(s, r), text: "Yes, delete" }), " ",
+        el("button", { onclick: () => { state.confirming = null; renderTable(); }, text: "No" })));
+    }
+    tr.append(nameCell);
+    if (s.kind === "info") {
+      tr.append(el("td", { text: r.modId || "pz-vanilla" }));
+      const f = el("td", {}, flagBox(s, r, "removed", "removed"), flagBox(s, r, "obsolete", "obsolete"), flagBox(s, r, "existsAsVanilla", "vanilla"));
+      if (r.overrides) f.append(el("div", { text: "overrides: " + r.overrides.join(", ") }));
+      tr.append(f);
+    } else if (s.kind === "script" || s.kind === "string") {
+      if (s.kind === "script") tr.append(el("td", { text: r.version }));
+      tr.append(el("td", {}, flagBox(s, r, "isLoaded", "loaded")));
+    }
+    if (s.kind !== "objname") {
+      tr.append(el("td", {},
+        el("button", { onclick: () => { state.editing = state.editing === key ? null : key; state.confirming = null; renderTable(); }, text: "Edit" }), " ",
+        el("button", { onclick: () => { state.confirming = key; state.editing = null; renderTable(); }, text: "Delete" })));
+    }
+    table.append(tr);
+  }
+  pager.append(`${rows.length} rows. `);
+  if (pages > 1) {
+    pager.append(
+      el("button", { disabled: state.page === 0, onclick: () => { state.page--; renderTable(); }, text: "< Prev" }),
+      ` page ${state.page + 1} of ${pages} `,
+      el("button", { disabled: state.page >= pages - 1, onclick: () => { state.page++; renderTable(); }, text: "Next >" }));
+  }
+}
+
+function renderLists(table) {
+  const wd = state.wd;
+  const useMod = new Map(), useModule = new Map();
+  wd.items.concat(wd.entities).forEach((r) => {
+    useModule.set(r.module, (useModule.get(r.module) || 0) + 1);
+    if (r.modId) useMod.set(r.modId, (useMod.get(r.modId) || 0) + 1);
+  });
+  table.append(el("tr", {}, el("th", { text: "#" }), el("th", { text: "List" }), el("th", { text: "Name" }), el("th", { text: "Used by" })));
+  wd.mods.forEach((m, i) => table.append(el("tr", {}, el("td", { text: String(i) }), el("td", { text: "mod" }), el("td", { text: m }), el("td", { text: String(useMod.get(m) || 0) }))));
+  wd.modules.forEach((m, i) => table.append(el("tr", {}, el("td", { text: String(i) }), el("td", { text: "module" }), el("td", { text: m }), el("td", { text: String(useModule.get(m) || 0) }))));
+}
+
+function issues() {
+  const out = [];
+  for (const s of sections()) {
+    if (!["info", "script", "string", "objname"].includes(s.kind)) continue;
+    const names = new Map(), ids = new Map();
+    s.rows.forEach((r) => {
+      const n = fullName(s, r);
+      names.set(n, (names.get(n) || 0) + 1);
+      ids.set(r.id, (ids.get(r.id) || 0) + 1);
+    });
+    names.forEach((n, k) => { if (n > 1) out.push(["err", `${s.label}: name ${k} appears ${n} times`]); });
+    ids.forEach((n, k) => { if (n > 1) out.push(["err", `${s.label}: ID ${k} appears ${n} times`]); });
+  }
+  const sc = state.wd.scriptRegisters.find((g) => g.register === "SpriteConfigs");
+  if (sc) {
+    const byShort = new Map();
+    sc.entries.filter((e) => e.isLoaded).forEach((e) => { const short = e.name.slice(e.name.indexOf(".") + 1); byShort.set(short, (byShort.get(short) || []).concat(e.name)); });
+    byShort.forEach((list) => { if (list.length > 1) out.push(["warn", `SpriteConfigs: both ${list.join(" and ")} are loaded. If they use the same sprites, clients will fail to join.`]); });
+  }
+  return out;
+}
+
+function renderIssues() {
+  const ul = $("issues"); ul.textContent = "";
+  const list = issues();
+  if (!list.length) ul.append(el("li", { text: "None." }));
+  list.forEach(([cls, text]) => ul.append(el("li", { class: cls, text: (cls === "err" ? "Error: " : "Warning: ") + text })));
+}
+
+function renderChanges() {
+  const ol = $("changes"); ol.textContent = "";
+  if (!state.changes.length) ol.append(el("li", { text: "No changes yet." }));
+  state.changes.forEach((c) => ol.append(el("li", { text: c })));
+  $("btn-undo").disabled = !state.history.length;
+  $("btn-reset").disabled = !state.changes.length;
+}
+
+function undo() {
+  const h = state.history.pop();
+  if (!h) return;
+  Object.assign(state, { wd: h.wd, changes: h.changes, changed: h.changed, editing: null, confirming: null });
+  renderAll();
+}
+
+function save() {
+  if (!state.wd) return;
+  const errs = issues().filter(([k]) => k === "err");
+  if (errs.length) { setStatus("Fix problems first: " + errs[0][1], "err"); return; }
+  let bytes;
+  try { bytes = WD.serialize(structuredClone(state.wd)); WD.parse(bytes); }
+  catch (err) { setStatus("Could not build file: " + err.message, "err"); return; }
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+  const a = el("a", { href: url, download: "WorldDictionary.bin" });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  setStatus(`Saved WorldDictionary.bin (${bytes.length} bytes).`, "ok");
+}
+
+function renderAll() { facts(); renderTabs(); renderFilters(); renderTable(); renderChanges(); renderIssues(); }
+
+$("file-input").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.arrayBuffer().then((b) => load(new Uint8Array(b), f.name));
+  e.target.value = "";
+});
+$("q").addEventListener("input", () => { state.page = 0; renderTable(); });
+$("f-mod").addEventListener("change", () => { state.page = 0; renderTable(); });
+$("f-state").addEventListener("change", () => { state.page = 0; renderTable(); });
+$("btn-save").addEventListener("click", save);
+$("btn-undo").addEventListener("click", undo);
+$("btn-reset").addEventListener("click", () => { if (state.original) load(state.original, state.fileName); });
+
+setStatus("Open a WorldDictionary.bin to start.");
+$("btn-save").disabled = true; $("btn-undo").disabled = true; $("btn-reset").disabled = true;
+</script>
+
+</body></html>
